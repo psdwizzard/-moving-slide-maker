@@ -1,0 +1,28 @@
+﻿# Node modules
+node_modules/
+
+# Build outputs
+public/exports/
+!public/exports/.gitkeep
+temp/
+!temp/.gitkeep
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Environment overrides
+.env
+
+# Video artifacts
+clip-*.mp4
+
+images/
+!images/.gitkeep
+
+
