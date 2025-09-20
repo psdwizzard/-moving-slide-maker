@@ -25,6 +25,7 @@ const EXPORTS_DIR = path.join(PUBLIC_DIR, "exports");
 const OUTPUT_DIR = path.join(ROOT_DIR, "output");
 const SETTINGS_PATH = path.join(OUTPUT_DIR, "settings.json");
 
+const SUPPORTED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
 // --- Config ---
 // Location of the FFmpeg binary used for every encoding step.
 const FFMPEG_PATH = "C:\\ffmpeg\\bin\\ffmpeg.exe";
@@ -381,6 +382,7 @@ async function archiveClipsAndFinal(projectDir, clipTempPaths, finalVideoName, m
 }
 
 
+
 async function refreshProjectManifest(projectDir, slug, existingManifest) {
   const manifest = existingManifest ? { ...existingManifest } : { slug, name: slug, images: [] };
   manifest.slug = slug;
@@ -389,10 +391,10 @@ async function refreshProjectManifest(projectDir, slug, existingManifest) {
   const clipsDir = path.join(projectDir, 'clips');
 
   const existingImageMap = new Map();
-  if (Array.isArray(manifest.images)) {
-    manifest.images.forEach((image) => {
+  if (Array.isArray(existingManifest?.images)) {
+    existingManifest.images.forEach((image, index) => {
       if (image?.id) {
-        existingImageMap.set(image.id, image);
+        existingImageMap.set(image.id, { data: image, index });
       }
     });
   }
@@ -400,15 +402,19 @@ async function refreshProjectManifest(projectDir, slug, existingManifest) {
   let imageEntries = [];
   if (await pathExists(imagesDir)) {
     const imageFiles = await fsp.readdir(imagesDir, { withFileTypes: true });
-    imageEntries = await Promise.all(
+    imageEntries = (await Promise.all(
       imageFiles
         .filter((entry) => entry.isFile())
         .map(async (entry) => {
           const fileName = entry.name;
+          const ext = path.extname(fileName).toLowerCase();
+          if (!SUPPORTED_IMAGE_EXTENSIONS.has(ext)) {
+            return null;
+          }
           const absolutePath = path.join(imagesDir, fileName);
           const stats = await fsp.stat(absolutePath);
           const id = path.parse(fileName).name;
-          const existing = existingImageMap.get(id) || {};
+          const existing = existingImageMap.get(id)?.data || {};
           return {
             id,
             fileName,
@@ -416,18 +422,33 @@ async function refreshProjectManifest(projectDir, slug, existingManifest) {
             imageUrl: existing.imageUrl || null,
             size: stats.size,
             config: existing.config ? { ...existing.config } : {},
-            clipFile: existing.clipFile || null
+            clipFile: existing.clipFile || null,
+            __order: existingImageMap.get(id)?.index
           };
         })
-    );
-    imageEntries.sort((a, b) => a.fileName.localeCompare(b.fileName, undefined, { numeric: true }));
+    )).filter(Boolean);
+    imageEntries.sort((a, b) => {
+      const orderA = a.__order;
+      const orderB = b.__order;
+      if (Number.isInteger(orderA) && Number.isInteger(orderB)) {
+        return orderA - orderB;
+      }
+      if (Number.isInteger(orderA)) {
+        return -1;
+      }
+      if (Number.isInteger(orderB)) {
+        return 1;
+      }
+      return a.fileName.localeCompare(b.fileName, undefined, { numeric: true });
+    });
   }
 
   manifest.images = imageEntries.map((entry) => {
-    const existing = existingImageMap.get(entry.id);
+    const existing = existingImageMap.get(entry.id)?.data;
     const config = existing?.config ? { ...existing.config } : entry.config || {};
+    const { __order: _ignoredOrder, ...rest } = entry;
     return {
-      ...entry,
+      ...rest,
       config: resolveConfigWithDefaults(config, BASE_DEFAULT_CONFIG)
     };
   });
@@ -454,11 +475,11 @@ async function refreshProjectManifest(projectDir, slug, existingManifest) {
 
   manifest.images = await Promise.all(
     manifest.images.map(async (image, index) => {
-      let clipFile = image.clipFile || null;
-      if (clipFile) {
-        const clipAbsolute = path.join(projectDir, ...toPosixPath(clipFile).split('/'));
+      const existingClip = image.clipFile ? toPosixPath(image.clipFile) : null;
+      if (existingClip) {
+        const clipAbsolute = path.join(projectDir, ...existingClip.split('/'));
         if (await pathExists(clipAbsolute)) {
-          return { ...image, clipFile: toPosixPath(clipFile) };
+          return { ...image, clipFile: existingClip };
         }
       }
       const fallback = clipsOnDisk.get(index) || null;
