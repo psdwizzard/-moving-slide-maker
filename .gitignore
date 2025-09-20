@@ -4,8 +4,6 @@ node_modules/
 # Build outputs
 public/exports/
 !public/exports/.gitkeep
-temp/
-!temp/.gitkeep
 
 # Logs
 npm-debug.log*
@@ -29,3 +27,5 @@ images/
 output/**
 !output/.gitkeep
 !output/**/.gitkeep
+temp/**
+!temp/**/.gitkeep

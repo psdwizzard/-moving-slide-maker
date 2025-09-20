@@ -80,6 +80,30 @@ async function findFirstExisting(paths) {
   return null;
 }
 
+async function cleanupFramesForIndex(imageIndex) {
+  const prefix = `img-${imageIndex}-frame-`;
+  try {
+    const entries = await fsp.readdir(FRAMES_DIR);
+    const targets = entries.filter((name) => name.startsWith(prefix));
+    if (!targets.length) {
+      return;
+    }
+    await Promise.all(
+      targets.map((name) =>
+        fsp.unlink(path.join(FRAMES_DIR, name)).catch((err) => {
+          if (err?.code !== 'ENOENT') {
+            console.warn(`Failed to remove frame ${name}:`, err.message);
+          }
+        })
+      )
+    );
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      console.warn(`Failed to list frames for index ${imageIndex}:`, err.message);
+    }
+  }
+}
+
 async function prepareProjectImage(entry, slug, projectDir) {
   const projectImagesDir = path.join(projectDir, 'images');
   await ensureDirectory(projectImagesDir);
@@ -495,8 +519,10 @@ app.post("/api/projects/:project/regenerate-clip", async (req, res) => {
 
     const preparedEntry = await prepareProjectImage({ ...existing, config: resolvedConfig }, slug, projectDir);
 
+    await cleanupFramesForIndex(imageIndex);
     await generateFramesForImage(preparedEntry, imageIndex);
     const clipTempPath = await createClipFromFrames(imageIndex, resolvedConfig.duration);
+    await cleanupFramesForIndex(imageIndex);
 
     const clipPaths = manifest.images.map((img, idx) => {
       if (idx === imageIndex) {
@@ -579,10 +605,13 @@ app.post("/api/export-video", async (req, res) => {
       const preparedImage = await prepareProjectImage(resolvedPlan[i], slug, projectDir);
       resolvedPlan[i] = preparedImage;
 
+      await cleanupFramesForIndex(i);
+
       console.log(`Processing image ${i + 1}/${resolvedPlan.length}: ${preparedImage.fileName}`);
       await generateFramesForImage(preparedImage, i);
       const tempClipPath = await createClipFromFrames(i, preparedImage.config.duration);
       clipPaths.push(tempClipPath);
+      await cleanupFramesForIndex(i);
     }
 
     console.log("All clips generated. Combining into final video...");
@@ -666,6 +695,8 @@ app.post("/api/export-frame", async (req, res) => {
 
     const absolutePath = await resolveImageAbsolutePath(imageConfig, slug || null);
 
+    await cleanupFramesForIndex(imageIndex);
+
     const safeId = (imageConfig.id || path.parse(imageConfig.fileName || `image-${imageIndex}`).name)
       .toString()
       .replace(/[^a-z0-9_-]/gi, "_")
@@ -685,6 +716,8 @@ app.post("/api/export-frame", async (req, res) => {
       singleProgress,
       outputPath,
     });
+
+    await cleanupFramesForIndex(imageIndex);
 
     res.status(200).json({
       success: true,
