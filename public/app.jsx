@@ -57,6 +57,8 @@ function App() {
   const [showProjectsPanel, setShowProjectsPanel] = useState(false);
   const [regeneratingImageId, setRegeneratingImageId] = useState(null);
   const [isSavingDefault, setIsSavingDefault] = useState(false);
+  const [exportScope, setExportScope] = useState('all');
+  const [exportRange, setExportRange] = useState('');
 
   // Load the set of available source images when the app boots.
   useEffect(() => {
@@ -68,9 +70,10 @@ function App() {
         return res.json();
       })
       .then((data) => {
-        setImages(data);
-        if (data.length && !selectedImageId) {
-          setSelectedImageId(data[0].id);
+        const hydratedImages = data.map((item) => ({ ...item, clipFile: item.clipFile || null }));
+        setImages(hydratedImages);
+        if (hydratedImages.length && !selectedImageId) {
+          setSelectedImageId(hydratedImages[0].id);
         }
       })
       .catch((error) => {
@@ -205,7 +208,8 @@ function App() {
         url,
         thumbnailUrl: url,
         size: item.size ?? 0,
-        imagePath: relativePath
+        imagePath: relativePath,
+        clipFile: item.clipFile || null
       };
     });
   }, []);
@@ -245,6 +249,23 @@ function App() {
     setSelectedImageId(images[fallbackIndex].id);
   }, [images, selectedImageId, projectImageMap]);
 
+  const handleExportScopeChange = useCallback((event) => {
+    const nextScope = event.target.value;
+    setExportScope(nextScope);
+    if (nextScope !== 'range') {
+      setExportRange('');
+    }
+  }, []);
+
+  const isRangeMode = exportScope === 'range';
+  const exportButtonDisabled =
+    isExporting || !projectName.trim() || (isRangeMode && !exportRange.trim());
+  const exportButtonTitle = !projectName.trim()
+    ? 'Enter a project name first'
+    : isRangeMode && !exportRange.trim()
+      ? 'Specify clip indices (e.g. 1-4,6)'
+      : undefined;
+
   // Compose the payload consumed by the export endpoints.
   const buildPlanPayload = useCallback(() => {
     const trimmedName = projectName.trim();
@@ -254,6 +275,7 @@ function App() {
         id: image.id,
         fileName: image.fileName,
         imagePath: image.imagePath || null,
+        clipFile: image.clipFile || null,
         size: image.size,
         config: {
           ...defaultConfig,
@@ -271,12 +293,25 @@ function App() {
       return;
     }
 
+    if (exportScope === 'range' && !exportRange.trim()) {
+      setExportStatus('Specify which clips to render (e.g. 1-4,6).');
+      return;
+    }
+
     setIsExporting(true);
-    setExportStatus('Exporting video...');
+    const trimmedRange = exportRange.trim();
+    const scopedStatus = exportScope === 'missing'
+      ? 'Rendering missing clips...'
+      : exportScope === 'range'
+        ? `Rendering selected clips${trimmedRange ? ` (${trimmedRange})` : ''}...`
+        : 'Rendering all clips...';
+    setExportStatus(scopedStatus);
 
     const payload = {
       ...buildPlanPayload(),
-      projectName: trimmedName
+      projectName: trimmedName,
+      renderMode: exportScope,
+      ...(exportScope === 'range' ? { renderRange: trimmedRange } : {})
     };
 
     try {
@@ -315,10 +350,11 @@ function App() {
         refreshProjects();
       }
 
+      const completedMessage = result.message || 'Export complete!';
       if (result.downloadUrl) {
-        setExportStatus(`Export complete! Download: ${result.downloadUrl}`);
+        setExportStatus(`${completedMessage} Download: ${result.downloadUrl}`);
       } else {
-        setExportStatus(result.message || 'Export process initiated.');
+        setExportStatus(completedMessage);
       }
     } catch (error) {
       setExportStatus(`Error: ${error.message}`);
@@ -751,12 +787,38 @@ function App() {
           </div>
 
           <div className="Toolbar__group Toolbar__group--actions">
+            <div className="Toolbar__exportOptions">
+              <label>
+                Mode
+                <select
+                  value={exportScope}
+                  onChange={handleExportScopeChange}
+                  disabled={isExporting}
+                >
+                  <option value="all">Render all clips</option>
+                  <option value="missing">Render missing clips</option>
+                  <option value="range">Render specific clips</option>
+                </select>
+              </label>
+              {isRangeMode && (
+                <label className="Toolbar__rangeInput">
+                  Range
+                  <input
+                    type="text"
+                    value={exportRange}
+                    onChange={(event) => setExportRange(event.target.value)}
+                    placeholder="e.g. 1-4,6,9"
+                    disabled={isExporting}
+                  />
+                </label>
+              )}
+            </div>
             <button
               onClick={handleExportVideo}
-              disabled={isExporting || !projectName.trim()}
-              title={!projectName.trim() ? 'Enter a project name first' : undefined}
+              disabled={exportButtonDisabled}
+              title={exportButtonTitle}
             >
-              {isExporting ? "Exporting..." : "Export MP4"}
+              {isExporting ? 'Exporting...' : 'Export MP4'}
             </button>
           </div>
         </div>

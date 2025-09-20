@@ -365,6 +365,31 @@ button {
   color: #9ca3af;
   margin: 0.25rem 0;
 }
+.Toolbar__exportOptions {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.Toolbar__exportOptions label {
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
+.Toolbar__exportOptions select,
+.Toolbar__exportOptions input {
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  border: 1px solid #30363d;
+  background: #0d1117;
+  color: inherit;
+}
+
+.Toolbar__rangeInput input {
+  width: 160px;
+}
+
 .Toolbar__group--actions button {
   background: #238636;
   border-color: #2ea043;

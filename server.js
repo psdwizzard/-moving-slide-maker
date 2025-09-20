@@ -104,6 +104,44 @@ async function cleanupFramesForIndex(imageIndex) {
   }
 }
 
+function parseRenderRange(rangeText, total) {
+  if (!rangeText) {
+    return new Set();
+  }
+  const tokens = String(rangeText)
+    .split(',')
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const values = new Set();
+  for (const token of tokens) {
+    if (token.includes('-')) {
+      const [startRaw, endRaw] = token.split('-').map((part) => part.trim());
+      const start = Number.parseInt(startRaw, 10);
+      const end = Number.parseInt(endRaw, 10);
+      if (Number.isInteger(start) && Number.isInteger(end)) {
+        const lower = Math.min(start, end);
+        const upper = Math.max(start, end);
+        for (let value = lower; value <= upper; value++) {
+          values.add(value);
+        }
+      }
+    } else {
+      const single = Number.parseInt(token, 10);
+      if (Number.isInteger(single)) {
+        values.add(single);
+      }
+    }
+  }
+  const bounded = new Set();
+  for (const value of values) {
+    const index = value - 1;
+    if (index >= 0 && index < total) {
+      bounded.add(index);
+    }
+  }
+  return bounded;
+}
+
 async function prepareProjectImage(entry, slug, projectDir) {
   const projectImagesDir = path.join(projectDir, 'images');
   await ensureDirectory(projectImagesDir);
@@ -569,10 +607,13 @@ app.post("/api/projects/:project/regenerate-clip", async (req, res) => {
   }
 });
 
+
 app.post("/api/export-video", async (req, res) => {
   console.log("Received video export request...");
   const plan = req.body.plan;
   const projectName = req.body.projectName;
+  const renderMode = (typeof req.body.renderMode === 'string' ? req.body.renderMode : 'all').toLowerCase();
+  const renderRangeRaw = typeof req.body.renderRange === 'string' ? req.body.renderRange : '';
 
   if (!projectName || typeof projectName !== 'string') {
     return res.status(400).json({ error: 'projectName is required.' });
@@ -596,8 +637,50 @@ app.post("/api/export-video", async (req, res) => {
     await ensureDirectory(FRAMES_DIR);
     await ensureDirectory(CLIPS_DIR);
 
+    const projectClipsDir = path.join(projectDir, "clips");
+    await ensureDirectory(projectClipsDir);
+
     const settings = await loadSettings();
     const resolvedPlan = await resolvePlanWithDefaults(plan, settings.defaultConfig, settings);
+
+    const existingManifest = await loadManifest(projectDir);
+    const existingImageMap = new Map();
+    if (existingManifest?.images) {
+      existingManifest.images.forEach((img) => {
+        if (img?.id) {
+          existingImageMap.set(img.id, img);
+        }
+      });
+    }
+
+    const alwaysMissing = new Set();
+    for (let i = 0; i < resolvedPlan.length; i++) {
+      const candidate = resolvedPlan[i];
+      const manifestEntry = existingImageMap.get(candidate.id);
+      const clipRelative = candidate.clipFile || manifestEntry?.clipFile;
+      if (!clipRelative) {
+        alwaysMissing.add(i);
+        continue;
+      }
+      const absoluteClip = path.join(projectDir, ...toPosixPath(clipRelative).split('/'));
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await pathExists(absoluteClip))) {
+        alwaysMissing.add(i);
+      }
+    }
+
+    let indicesToRender;
+    if (renderMode === 'missing') {
+      indicesToRender = new Set(alwaysMissing);
+    } else if (renderMode === 'range') {
+      const rangeSet = parseRenderRange(renderRangeRaw, resolvedPlan.length);
+      indicesToRender = new Set([...rangeSet, ...alwaysMissing]);
+      if (!indicesToRender.size) {
+        return res.status(400).json({ error: 'No matching clips found for the requested range.' });
+      }
+    } else {
+      indicesToRender = new Set(Array.from({ length: resolvedPlan.length }, (_, idx) => idx));
+    }
 
     const clipPaths = [];
 
@@ -605,23 +688,38 @@ app.post("/api/export-video", async (req, res) => {
       const preparedImage = await prepareProjectImage(resolvedPlan[i], slug, projectDir);
       resolvedPlan[i] = preparedImage;
 
-      await cleanupFramesForIndex(i);
+      const manifestEntry = existingImageMap.get(preparedImage.id);
+      let clipRelative = preparedImage.clipFile || manifestEntry?.clipFile || path.posix.join('clips', `clip-${i}.mp4`);
+      clipRelative = toPosixPath(clipRelative);
+      let existingClipAbsolute = path.join(projectDir, ...clipRelative.split('/'));
 
-      console.log(`Processing image ${i + 1}/${resolvedPlan.length}: ${preparedImage.fileName}`);
-      await generateFramesForImage(preparedImage, i);
-      const tempClipPath = await createClipFromFrames(i, preparedImage.config.duration);
-      clipPaths.push(tempClipPath);
-      await cleanupFramesForIndex(i);
+      let shouldRender = indicesToRender.has(i);
+      if (!shouldRender && !(await pathExists(existingClipAbsolute))) {
+        shouldRender = true;
+      }
+
+      if (shouldRender) {
+        await cleanupFramesForIndex(i);
+        console.log(`Processing image ${i + 1}/${resolvedPlan.length}: ${preparedImage.fileName}`);
+        await generateFramesForImage(preparedImage, i);
+        const tempClipPath = await createClipFromFrames(i, preparedImage.config.duration);
+        clipPaths.push(tempClipPath);
+        preparedImage.clipFile = path.posix.join('clips', `clip-${i}.mp4`);
+        await cleanupFramesForIndex(i);
+      } else {
+        console.log(`Reusing existing clip for image ${i + 1}`);
+        clipPaths.push(existingClipAbsolute);
+        preparedImage.clipFile = toPosixPath(path.relative(projectDir, existingClipAbsolute));
+      }
     }
 
-    console.log("All clips generated. Combining into final video...");
+    console.log("All clips ready. Combining into final video...");
     const finalVideoName = await combineClips(clipPaths, resolvedPlan, { outputNamePrefix: slug });
 
     console.log("Archiving clips and final output...");
     const archived = await archiveClipsAndFinal(projectDir, clipPaths, finalVideoName, resolvedPlan);
 
     const now = new Date().toISOString();
-    const existingManifest = await loadManifest(projectDir);
     const finalVideoRelative = toPosixPath(path.relative(projectDir, archived.finalPath));
 
     const manifestRecord = {
@@ -644,15 +742,20 @@ app.post("/api/export-video", async (req, res) => {
     const projects = await listProjects();
     const hydratedManifest = hydrateManifest(manifestRecord, slug);
 
-    console.log(`Export complete: ${finalVideoName}`);
+    const scopeDescription = renderMode === 'missing'
+      ? 'missing clips'
+      : renderMode === 'range'
+        ? `selected clips${renderRangeRaw ? ` (${renderRangeRaw})` : ''}`
+        : 'all clips';
+
+    console.log(`Export complete (${scopeDescription}): ${finalVideoName}`);
     res.status(200).json({
       success: true,
-      message: "Export complete!",
+      message: `Export complete (${scopeDescription}).`,
       downloadUrl: `/exports/${finalVideoName}`,
       manifest: hydratedManifest,
       projects
     });
-
   } catch (error) {
     console.error("Video export failed:", error);
     res.status(500).json({ success: false, message: `Export failed: ${error.message}` });
