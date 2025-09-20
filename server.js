@@ -8,7 +8,8 @@
 const express = require("express");
 const http = require("http");
 const path = require("path");
-const fs = require("fs").promises;
+const fs = require("fs");
+const fsp = fs.promises;
 const ffmpeg = require("fluent-ffmpeg");
 const sharp = require("sharp");
 
@@ -20,18 +21,335 @@ const LOOPBACK_HOST = "127.0.0.1";
 const ROOT_DIR = __dirname;
 const PUBLIC_DIR = path.join(ROOT_DIR, "public");
 const IMAGES_DIR = path.join(ROOT_DIR, "images");
-const EXPORTS_DIR = path.join(ROOT_DIR, "public", "exports");
+const EXPORTS_DIR = path.join(PUBLIC_DIR, "exports");
+const OUTPUT_DIR = path.join(ROOT_DIR, "output");
+const SETTINGS_PATH = path.join(OUTPUT_DIR, "settings.json");
 
 // --- Config ---
 // Location of the FFmpeg binary used for every encoding step.
 const FFMPEG_PATH = "C:\\ffmpeg\\bin\\ffmpeg.exe";
 ffmpeg.setFfmpegPath(FFMPEG_PATH);
 
+// --- Helpers ---
+function fileExistsSync(targetPath) {
+  try {
+    fs.accessSync(targetPath);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function ensureDirectory(targetPath) {
+  await fsp.mkdir(targetPath, { recursive: true });
+}
+
+
+async function pathExists(targetPath) {
+  try {
+    await fsp.access(targetPath);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+function toPosixPath(value) {
+  if (!value) {
+    return value;
+  }
+  return value.split(path.sep).join('/');
+}
+
+function buildProjectAssetUrl(slug, relativePath) {
+  const normalized = toPosixPath(relativePath || '');
+  const segments = normalized.split('/').filter(Boolean);
+  const encoded = [slug, ...segments].map((segment) => encodeURIComponent(segment));
+  return `/projects/${encoded.join('/')}`;
+}
+
+async function findFirstExisting(paths) {
+  for (const candidate of paths) {
+    if (!candidate) {
+      continue;
+    }
+    if (await pathExists(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function prepareProjectImage(entry, slug, projectDir) {
+  const projectImagesDir = path.join(projectDir, 'images');
+  await ensureDirectory(projectImagesDir);
+
+  const fallbackRelative = path.posix.join('images', entry.fileName);
+  const relativePathRaw = entry.imagePath ? toPosixPath(entry.imagePath) : fallbackRelative;
+  const relativePath = relativePathRaw || fallbackRelative;
+  const absolutePath = path.join(projectDir, ...relativePath.split('/'));
+
+  if (!(await pathExists(absolutePath))) {
+    const manifestCandidate = entry.imagePath
+      ? path.join(projectDir, ...toPosixPath(entry.imagePath).split('/'))
+      : null;
+    const existingSource = await findFirstExisting([
+      entry.absolutePath,
+      manifestCandidate,
+      path.join(IMAGES_DIR, entry.fileName)
+    ]);
+    const sourcePath = existingSource || path.join(IMAGES_DIR, entry.fileName);
+    if (!(await pathExists(sourcePath))) {
+      throw new Error(`Source image not found for ${entry.fileName}`);
+    }
+    if (path.resolve(sourcePath) !== path.resolve(absolutePath)) {
+      await ensureDirectory(path.dirname(absolutePath));
+      await fsp.rename(sourcePath, absolutePath);
+    }
+  }
+
+  const stats = await fsp.stat(absolutePath);
+  const relativeToProject = toPosixPath(path.relative(projectDir, absolutePath));
+
+  return {
+    ...entry,
+    imagePath: relativeToProject,
+    absolutePath,
+    imageUrl: buildProjectAssetUrl(slug, relativeToProject),
+    size: stats.size
+  };
+}
+
+async function resolveImageAbsolutePath(entry, slug) {
+  if (entry?.absolutePath && await pathExists(entry.absolutePath)) {
+    return entry.absolutePath;
+  }
+  if (slug) {
+    const projectDir = path.join(OUTPUT_DIR, slug);
+    if (entry?.imagePath) {
+      const manifestPath = path.join(projectDir, ...toPosixPath(entry.imagePath).split('/'));
+      if (await pathExists(manifestPath)) {
+        return manifestPath;
+      }
+    }
+    const projectDefault = path.join(projectDir, 'images', entry.fileName);
+    if (await pathExists(projectDefault)) {
+      return projectDefault;
+    }
+  }
+  const ingestPath = path.join(IMAGES_DIR, entry.fileName);
+  if (await pathExists(ingestPath)) {
+    return ingestPath;
+  }
+  throw new Error(`Source image not found for ${entry.fileName}`);
+}
+
+function toManifestImageRecord(entry) {
+  const relativePath = entry.imagePath ? toPosixPath(entry.imagePath) : path.posix.join('images', entry.fileName);
+  return {
+    id: entry.id,
+    fileName: entry.fileName,
+    imagePath: relativePath,
+    imageUrl: entry.imageUrl || null,
+    size: entry.size,
+    config: entry.config,
+    clipFile: entry.clipFile ? toPosixPath(entry.clipFile) : null
+  };
+}
+
+function hydrateManifest(manifest, slug) {
+  if (!manifest) {
+    return null;
+  }
+  const safeSlug = manifest.slug || slug;
+  const images = Array.isArray(manifest.images)
+    ? manifest.images.map((image) => {
+        const relativePath = image.imagePath ? toPosixPath(image.imagePath) : path.posix.join('images', image.fileName);
+        const clipFile = image.clipFile ? toPosixPath(image.clipFile) : null;
+        return {
+          ...image,
+          imagePath: relativePath,
+          imageUrl: image.imageUrl || (safeSlug ? buildProjectAssetUrl(safeSlug, relativePath) : null),
+          clipFile,
+        };
+      })
+    : [];
+  const finalVideo = manifest.finalVideo
+    ? {
+        ...manifest.finalVideo,
+        path: manifest.finalVideo?.path ? toPosixPath(manifest.finalVideo.path) : manifest.finalVideo.path
+      }
+    : null;
+  return {
+    ...manifest,
+    slug: safeSlug,
+    images,
+    finalVideo
+  };
+}
+function sanitizeProjectName(rawName) {
+  const trimmed = (rawName || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed
+    .replace(/[\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, "-")
+    .toLowerCase();
+}
+
+async function readJSON(filePath, fallback) {
+  try {
+    const data = await fsp.readFile(filePath, "utf-8");
+    return JSON.parse(data);
+  } catch (err) {
+    return fallback;
+  }
+}
+
+async function writeJSON(filePath, value) {
+  await ensureDirectory(path.dirname(filePath));
+  await fsp.writeFile(filePath, JSON.stringify(value, null, 2));
+}
+
+async function loadSettings() {
+  const raw = await readJSON(SETTINGS_PATH, {});
+  const defaults = {
+    defaultConfig: { ...BASE_DEFAULT_CONFIG },
+    autoMotion: { ...SETTINGS_DEFAULTS.autoMotion }
+  };
+  return {
+    ...defaults,
+    ...raw,
+    defaultConfig: { ...BASE_DEFAULT_CONFIG, ...(raw?.defaultConfig || {}) },
+    autoMotion: { ...SETTINGS_DEFAULTS.autoMotion, ...(raw?.autoMotion || {}) }
+  };
+}
+
+async function saveSettings(settings) {
+  const payload = {
+    defaultConfig: settings.defaultConfig,
+    autoMotion: settings.autoMotion
+  };
+  await writeJSON(SETTINGS_PATH, payload);
+}
+
+function resolveConfigWithDefaults(config, defaultConfig) {
+  return {
+    duration: getSafeDuration(config?.duration ?? defaultConfig.duration),
+    zoom: getSafeZoom(config?.zoom ?? defaultConfig.zoom),
+    fadeDuration: Number.isFinite(config?.fadeDuration) ? Math.max(0, config.fadeDuration) : defaultConfig.fadeDuration,
+    motionStyle: config?.motionStyle || defaultConfig.motionStyle || "ping-pong",
+    lockZoom: Boolean(config?.lockZoom ?? defaultConfig.lockZoom),
+    targetPoint: config?.targetPoint || null,
+    arrow: config?.arrow || null,
+    preset: config?.preset || defaultConfig.preset || "custom"
+  };
+}
+
+async function loadManifest(projectDir) {
+  const manifestPath = path.join(projectDir, "manifest.json");
+  return readJSON(manifestPath, null);
+}
+
+async function saveManifest(projectDir, manifest) {
+  const manifestPath = path.join(projectDir, "manifest.json");
+  await writeJSON(manifestPath, manifest);
+}
+
+async function listProjects() {
+  if (!fileExistsSync(OUTPUT_DIR)) {
+    return [];
+  }
+  const entries = await fsp.readdir(OUTPUT_DIR, { withFileTypes: true });
+  const projects = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const projectDir = path.join(OUTPUT_DIR, entry.name);
+    const manifest = await loadManifest(projectDir);
+    if (!manifest) {
+      continue;
+    }
+    const normalizedManifest = hydrateManifest(manifest, entry.name);
+    projects.push({
+      name: normalizedManifest?.name,
+      slug: normalizedManifest?.slug || entry.name,
+      createdAt: normalizedManifest?.createdAt,
+      updatedAt: normalizedManifest?.updatedAt,
+      clipCount: normalizedManifest?.images?.length || 0,
+      finalVideo: normalizedManifest?.finalVideo || null
+    });
+  }
+  projects.sort((a, b) => {
+    const left = a.updatedAt || a.createdAt || "";
+    const right = b.updatedAt || b.createdAt || "";
+    return (right || "").localeCompare(left || "");
+  });
+  return projects;
+}
+
+async function archiveClipsAndFinal(projectDir, clipTempPaths, finalVideoName, manifestPlan) {
+  const clipsDir = path.join(projectDir, "clips");
+  await ensureDirectory(clipsDir);
+
+  for (let i = 0; i < clipTempPaths.length; i++) {
+    const tempClip = clipTempPaths[i];
+    const clipName = `clip-${i}.mp4`;
+    const destClipPath = path.join(clipsDir, clipName);
+
+    if (path.resolve(tempClip) !== path.resolve(destClipPath)) {
+      await fsp.copyFile(tempClip, destClipPath);
+    }
+
+    if (manifestPlan[i]) {
+      const relativeClip = toPosixPath(path.relative(projectDir, destClipPath));
+      manifestPlan[i].clipFile = relativeClip;
+    }
+  }
+
+  const finalSource = path.join(EXPORTS_DIR, finalVideoName);
+  const finalDest = path.join(projectDir, finalVideoName);
+  await fsp.copyFile(finalSource, finalDest);
+
+  return {
+    finalPath: finalDest
+  };
+}
+
+async function resolvePlanWithDefaults(plan, defaultConfig, settings, options = {}) {
+  const resolved = [];
+  let mutated = false;
+  for (let i = 0; i < plan.length; i++) {
+    const entry = plan[i];
+    const config = resolveConfigWithDefaults(entry.config || {}, defaultConfig);
+    if (!config.targetPoint) {
+      config.targetPoint = { x: 50, y: 50 };
+      const nextMotion = settings.autoMotion?.next === 'zoom-out' ? 'zoom-out' : 'zoom-in';
+      config.motionStyle = nextMotion;
+      settings.autoMotion = { next: nextMotion === 'zoom-in' ? 'zoom-out' : 'zoom-in' };
+      mutated = true;
+    }
+    resolved.push({
+      ...entry,
+      config
+    });
+  }
+
+  if (mutated && !options.skipSave) {
+    await saveSettings(settings);
+  }
+
+  return resolved;
+}
+
 // --- Middleware ---
 // Accept large payloads from the frontend when plans include many images.
 app.use(express.json({ limit: "50mb" }));
 // Serve the compiled frontend assets.
 app.use(express.static(PUBLIC_DIR));
+app.use('/projects', express.static(OUTPUT_DIR));
 
 // --- API Routes ---
 
@@ -39,7 +357,7 @@ app.use(express.static(PUBLIC_DIR));
 // Expose a manifest of images on disk for the frontend gallery.
 app.get("/api/images", async (req, res) => {
   try {
-    const files = await fs.readdir(IMAGES_DIR);
+    const files = await fsp.readdir(IMAGES_DIR);
     const imageEntries = [];
     for (const fileName of files) {
       const ext = path.extname(fileName).toLowerCase();
@@ -48,12 +366,13 @@ app.get("/api/images", async (req, res) => {
       }
 
       const absolutePath = path.join(IMAGES_DIR, fileName);
-      const stats = await fs.stat(absolutePath);
+      const stats = await fsp.stat(absolutePath);
       if (stats.isFile()) {
         const encodedFile = encodeURIComponent(fileName);
         imageEntries.push({
           id: path.parse(fileName).name,
           fileName,
+          imagePath: path.posix.join('images', fileName),
           url: `/images/${encodedFile}`,
           thumbnailUrl: `/images/${encodedFile}`,
           size: stats.size,
@@ -64,6 +383,317 @@ app.get("/api/images", async (req, res) => {
   } catch (err) {
     console.error("Error listing images:", err);
     res.status(500).json({ error: "Unable to read images" });
+  }
+});
+
+app.get("/api/projects", async (req, res) => {
+  try {
+    const projects = await listProjects();
+    res.json(projects);
+  } catch (error) {
+    console.error('Failed to list projects:', error);
+    res.status(500).json({ error: 'Unable to list projects' });
+  }
+});
+
+app.get("/api/projects/:project", async (req, res) => {
+  const slug = sanitizeProjectName(req.params.project);
+  if (!slug) {
+    return res.status(400).json({ error: 'Invalid project name' });
+  }
+
+  try {
+    const projectDir = path.join(OUTPUT_DIR, slug);
+    const manifest = await loadManifest(projectDir);
+    if (!manifest) {
+      return res.status(404).json({ error: 'Project not found' });
+    }
+    res.json(hydrateManifest(manifest, slug));
+  } catch (error) {
+    console.error('Failed to load project manifest:', error);
+    res.status(500).json({ error: 'Unable to load project manifest' });
+  }
+});
+
+app.get("/api/settings", async (req, res) => {
+  try {
+    const settings = await loadSettings();
+    res.json({
+      defaultConfig: settings.defaultConfig,
+      autoMotionNext: settings.autoMotion?.next || 'zoom-in'
+    });
+  } catch (error) {
+    console.error('Failed to load settings:', error);
+    res.status(500).json({ error: 'Unable to load settings' });
+  }
+});
+
+app.post("/api/settings/default-config", async (req, res) => {
+  try {
+    const settings = await loadSettings();
+    const bodyConfig = req.body?.defaultConfig;
+    if (!bodyConfig || typeof bodyConfig !== 'object') {
+      return res.status(400).json({ error: 'defaultConfig is required' });
+    }
+    const merged = resolveConfigWithDefaults(bodyConfig, settings.defaultConfig);
+    settings.defaultConfig = {
+      duration: merged.duration,
+      zoom: merged.zoom,
+      fadeDuration: merged.fadeDuration,
+      motionStyle: merged.motionStyle,
+      lockZoom: merged.lockZoom,
+      preset: merged.preset
+    };
+    await saveSettings(settings);
+    res.json({ defaultConfig: settings.defaultConfig });
+  } catch (error) {
+    console.error('Failed to update default config:', error);
+    res.status(500).json({ error: 'Unable to update default config' });
+  }
+});
+
+app.post("/api/projects/:project/regenerate-clip", async (req, res) => {
+  const slug = sanitizeProjectName(req.params.project);
+  if (!slug) {
+    return res.status(400).json({ error: 'Invalid project name' });
+  }
+
+  const projectDir = path.join(OUTPUT_DIR, slug);
+  const manifest = await loadManifest(projectDir);
+  if (!manifest) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+
+  const imageId = req.body?.imageId;
+  if (!imageId) {
+    return res.status(400).json({ error: 'imageId is required' });
+  }
+
+  const imageIndex = manifest.images.findIndex((img) => img.id === imageId);
+  if (imageIndex === -1) {
+    return res.status(404).json({ error: 'Image not found in project' });
+  }
+
+  try {
+    await fsp.rm(TEMP_DIR, { recursive: true, force: true });
+    await ensureDirectory(FRAMES_DIR);
+    await ensureDirectory(CLIPS_DIR);
+
+    const settings = await loadSettings();
+    const existing = manifest.images[imageIndex];
+    const incoming = req.body?.config && typeof req.body.config === 'object' ? req.body.config : null;
+    const mergedConfig = incoming ? { ...existing.config, ...incoming } : existing.config;
+    const resolvedConfig = resolveConfigWithDefaults(mergedConfig, settings.defaultConfig);
+
+    if (!resolvedConfig.targetPoint) {
+      resolvedConfig.targetPoint = { x: 50, y: 50 };
+      const nextMotion = settings.autoMotion?.next === 'zoom-out' ? 'zoom-out' : 'zoom-in';
+      resolvedConfig.motionStyle = nextMotion;
+      settings.autoMotion = { next: nextMotion === 'zoom-in' ? 'zoom-out' : 'zoom-in' };
+      await saveSettings(settings);
+    }
+
+    const preparedEntry = await prepareProjectImage({ ...existing, config: resolvedConfig }, slug, projectDir);
+
+    await generateFramesForImage(preparedEntry, imageIndex);
+    const clipTempPath = await createClipFromFrames(imageIndex, resolvedConfig.duration);
+
+    const clipPaths = manifest.images.map((img, idx) => {
+      if (idx === imageIndex) {
+        return clipTempPath;
+      }
+      const relative = img.clipFile ? toPosixPath(img.clipFile) : path.posix.join('clips', `clip-${idx}.mp4`);
+      return path.join(projectDir, ...relative.split('/'));
+    });
+
+    const plan = manifest.images.map((img, idx) => ({
+      id: img.id,
+      fileName: img.fileName,
+      config: idx === imageIndex ? preparedEntry.config : img.config
+    }));
+
+    manifest.images[imageIndex] = preparedEntry;
+
+    const finalVideoName = await combineClips(clipPaths, plan, { outputNamePrefix: slug });
+    const archived = await archiveClipsAndFinal(projectDir, clipPaths, finalVideoName, manifest.images);
+
+    const finalVideoRelative = toPosixPath(path.relative(projectDir, archived.finalPath));
+    const updatedImages = manifest.images.map((img) => toManifestImageRecord(img));
+
+    const manifestRecord = {
+      ...manifest,
+      images: updatedImages,
+      finalVideo: {
+        fileName: finalVideoName,
+        path: finalVideoRelative
+      },
+      updatedAt: new Date().toISOString()
+    };
+
+    await saveManifest(projectDir, manifestRecord);
+    await fsp.rm(TEMP_DIR, { recursive: true, force: true });
+
+    const projects = await listProjects();
+    const hydratedManifest = hydrateManifest(manifestRecord, slug);
+
+    res.json({ success: true, manifest: hydratedManifest, projects });
+  } catch (error) {
+    console.error('Failed to regenerate clip:', error);
+    res.status(500).json({ error: `Clip regeneration failed: ${error.message}` });
+  }
+});
+
+app.post("/api/export-video", async (req, res) => {
+  console.log("Received video export request...");
+  const plan = req.body.plan;
+  const projectName = req.body.projectName;
+
+  if (!projectName || typeof projectName !== 'string') {
+    return res.status(400).json({ error: 'projectName is required.' });
+  }
+
+  if (!plan || !Array.isArray(plan) || plan.length === 0) {
+    return res.status(400).json({ error: "Invalid export plan provided." });
+  }
+
+  const slug = sanitizeProjectName(projectName);
+  if (!slug) {
+    return res.status(400).json({ error: 'Project name cannot be empty.' });
+  }
+
+  try {
+    const projectDir = path.join(OUTPUT_DIR, slug);
+    await ensureDirectory(projectDir);
+
+    console.log("Setting up temporary directories...");
+    await fsp.rm(TEMP_DIR, { recursive: true, force: true });
+    await ensureDirectory(FRAMES_DIR);
+    await ensureDirectory(CLIPS_DIR);
+
+    const settings = await loadSettings();
+    const resolvedPlan = await resolvePlanWithDefaults(plan, settings.defaultConfig, settings);
+
+    const clipPaths = [];
+
+    for (let i = 0; i < resolvedPlan.length; i++) {
+      const preparedImage = await prepareProjectImage(resolvedPlan[i], slug, projectDir);
+      resolvedPlan[i] = preparedImage;
+
+      console.log(`Processing image ${i + 1}/${resolvedPlan.length}: ${preparedImage.fileName}`);
+      await generateFramesForImage(preparedImage, i);
+      const tempClipPath = await createClipFromFrames(i, preparedImage.config.duration);
+      clipPaths.push(tempClipPath);
+    }
+
+    console.log("All clips generated. Combining into final video...");
+    const finalVideoName = await combineClips(clipPaths, resolvedPlan, { outputNamePrefix: slug });
+
+    console.log("Archiving clips and final output...");
+    const archived = await archiveClipsAndFinal(projectDir, clipPaths, finalVideoName, resolvedPlan);
+
+    const now = new Date().toISOString();
+    const existingManifest = await loadManifest(projectDir);
+    const finalVideoRelative = toPosixPath(path.relative(projectDir, archived.finalPath));
+
+    const manifestRecord = {
+      name: projectName,
+      slug,
+      createdAt: existingManifest?.createdAt || now,
+      updatedAt: now,
+      images: resolvedPlan.map((item) => toManifestImageRecord(item)),
+      finalVideo: {
+        fileName: finalVideoName,
+        path: finalVideoRelative
+      }
+    };
+
+    await saveManifest(projectDir, manifestRecord);
+
+    console.log("Cleaning up temporary files...");
+    await fsp.rm(TEMP_DIR, { recursive: true, force: true });
+
+    const projects = await listProjects();
+    const hydratedManifest = hydrateManifest(manifestRecord, slug);
+
+    console.log(`Export complete: ${finalVideoName}`);
+    res.status(200).json({
+      success: true,
+      message: "Export complete!",
+      downloadUrl: `/exports/${finalVideoName}`,
+      manifest: hydratedManifest,
+      projects
+    });
+
+  } catch (error) {
+    console.error("Video export failed:", error);
+    res.status(500).json({ success: false, message: `Export failed: ${error.message}` });
+  }
+});
+
+
+// POST /api/export-frame - Render a single frame for quick preview
+// Lightweight endpoint that renders a single frame for quick previews.
+app.post("/api/export-frame", async (req, res) => {
+  const plan = req.body.plan;
+  const targetId = req.body.singleFrame;
+
+  if (!plan || !Array.isArray(plan) || plan.length === 0) {
+    return res.status(400).json({ error: "Invalid export plan provided." });
+  }
+  if (!targetId) {
+    return res.status(400).json({ error: "No target image specified for frame export." });
+  }
+
+  const imageIndex = plan.findIndex((item) => item.id === targetId);
+  if (imageIndex === -1) {
+    return res.status(404).json({ error: "Requested image not found in the plan." });
+  }
+
+  const projectName = req.body?.projectName;
+  const slug = projectName ? sanitizeProjectName(projectName) : '';
+
+  const imageConfig = plan[imageIndex];
+  try {
+    await ensureDirectory(EXPORTS_DIR);
+    await fsp.rm(TEMP_DIR, { recursive: true, force: true });
+    await ensureDirectory(FRAMES_DIR);
+
+    const settings = await loadSettings();
+    const resolved = resolveConfigWithDefaults(imageConfig.config || {}, settings.defaultConfig);
+    if (!resolved.targetPoint) {
+      resolved.targetPoint = { x: 50, y: 50 };
+    }
+
+    const absolutePath = await resolveImageAbsolutePath(imageConfig, slug || null);
+
+    const safeId = (imageConfig.id || path.parse(imageConfig.fileName || `image-${imageIndex}`).name)
+      .toString()
+      .replace(/[^a-z0-9_-]/gi, "_")
+      .toLowerCase();
+    const outputName = `frame-${safeId}-${Date.now()}.png`;
+    const outputPath = path.join(EXPORTS_DIR, outputName);
+
+    let singleProgress = 1;
+    const motionStyle = resolved.motionStyle || 'ping-pong';
+    if (motionStyle === 'ping-pong') {
+      singleProgress = 0.5;
+    } else if (motionStyle === 'zoom-out') {
+      singleProgress = 0;
+    }
+
+    await generateFramesForImage({ ...imageConfig, absolutePath, config: resolved }, imageIndex, {
+      singleProgress,
+      outputPath,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Frame exported.',
+      downloadUrl: `/exports/${outputName}`,
+    });
+  } catch (error) {
+    console.error('Single frame export failed:', error);
+    res.status(500).json({ success: false, message: `Frame export failed: ${error.message}` });
   }
 });
 
@@ -79,6 +709,14 @@ const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
 const DEFAULT_DURATION = 6;
 const DEFAULT_ZOOM = 1.8;
+const BASE_DEFAULT_CONFIG = {
+  duration: DEFAULT_DURATION,
+  zoom: DEFAULT_ZOOM,
+  fadeDuration: 0.5,
+  motionStyle: "ping-pong",
+  lockZoom: false,
+  preset: "custom"
+};
 
 // Render images at a higher resolution before scaling to smooth zooms.
 const RENDER_OVERSAMPLE = Math.max(1, Number(process.env.RENDER_OVERSAMPLE) || 2);
@@ -87,6 +725,13 @@ const RENDER_OVERSAMPLE = Math.max(1, Number(process.env.RENDER_OVERSAMPLE) || 2
 const NVENC_CODEC = process.env.NVENC_CODEC || "h264_nvenc";
 const CPU_FALLBACK_CODEC = "libx264";
 const USE_NVENC = process.env.USE_NVENC !== "false";
+
+const SETTINGS_DEFAULTS = {
+  defaultConfig: BASE_DEFAULT_CONFIG,
+  autoMotion: {
+    next: "zoom-in"
+  }
+};
 
 // Build codec-specific flags for FFmpeg runs.
 function getCodecOptions(codec) {
@@ -322,12 +967,29 @@ function computeCropRect(transform, metrics, scale) {
 // Render per-frame crops for a single image at the requested motion path.
 async function generateFramesForImage(imageConfig, imageIndex, options = {}) {
   console.log(` -> Preparing frames for image ${imageIndex}`);
-  const imagePath = path.join(IMAGES_DIR, imageConfig.fileName);
+  const fallbackPath = path.join(IMAGES_DIR, imageConfig.fileName);
+  const candidatePaths = [];
 
-  let imageBuffer;
-  try {
-    imageBuffer = await fs.readFile(imagePath);
-  } catch (err) {
+  if (imageConfig.absolutePath) {
+    candidatePaths.push(imageConfig.absolutePath);
+  }
+  if (!candidatePaths.includes(fallbackPath)) {
+    candidatePaths.push(fallbackPath);
+  }
+
+  let imageBuffer = null;
+  let sourcePath = null;
+  for (const candidate of candidatePaths) {
+    try {
+      imageBuffer = await fsp.readFile(candidate);
+      sourcePath = candidate;
+      break;
+    } catch (err) {
+      continue;
+    }
+  }
+
+  if (!imageBuffer) {
     throw new Error(`Failed to read image file: ${imageConfig.fileName}`);
   }
 
@@ -501,8 +1163,9 @@ function createClipFromFrames(imageIndex, duration) {
 
 // --- Final Video Combination ---
 // Chain every clip together, applying fades between neighbors when requested.
-function combineClips(clipPaths, plan) {
-  const finalOutputName = `ken-burns-effect-${Date.now()}.mp4`;
+function combineClips(clipPaths, plan, options = {}) {
+  const outputNamePrefix = options.outputNamePrefix || 'ken-burns-effect';
+  const finalOutputName = `${outputNamePrefix}-${Date.now()}.mp4`;
   const finalOutputPath = path.join(EXPORTS_DIR, finalOutputName);
 
   if (!clipPaths || clipPaths.length === 0) {
@@ -510,7 +1173,7 @@ function combineClips(clipPaths, plan) {
   }
 
   if (clipPaths.length === 1) {
-    return fs.copyFile(clipPaths[0], finalOutputPath).then(() => finalOutputName);
+    return fsp.copyFile(clipPaths[0], finalOutputPath).then(() => finalOutputName);
   }
 
   const preferredCodec = USE_NVENC ? NVENC_CODEC : CPU_FALLBACK_CODEC;
@@ -582,137 +1245,6 @@ function combineClips(clipPaths, plan) {
 }
 
 
-// --- API Routes ---
-
-// GET /api/images - List all images in the images directory
-app.get("/api/images", async (req, res) => {
-  try {
-    const files = await fs.readdir(IMAGES_DIR);
-    const imageEntries = [];
-    for (const fileName of files) {
-      const ext = path.extname(fileName).toLowerCase();
-      if (![".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(ext)) {
-        continue;
-      }
-
-      const absolutePath = path.join(IMAGES_DIR, fileName);
-      const stats = await fs.stat(absolutePath);
-      if (stats.isFile()) {
-        const encodedFile = encodeURIComponent(fileName);
-        imageEntries.push({
-          id: path.parse(fileName).name,
-          fileName,
-          url: `/images/${encodedFile}`,
-          thumbnailUrl: `/images/${encodedFile}`,
-          size: stats.size,
-        });
-      }
-    }
-    res.json(imageEntries);
-  } catch (err) {
-    console.error("Error listing images:", err);
-    res.status(500).json({ error: "Unable to read images" });
-  }
-});
-
-// POST /api/export-video - Main video export logic
-// Main export endpoint that renders frames, encodes clips, then stitches them.
-app.post("/api/export-video", async (req, res) => {
-  console.log("Received video export request...");
-  const plan = req.body.plan;
-
-  if (!plan || !Array.isArray(plan) || plan.length === 0) {
-    return res.status(400).json({ error: "Invalid export plan provided." });
-  }
-
-  try {
-    console.log("Setting up temporary directories...");
-    await fs.rm(TEMP_DIR, { recursive: true, force: true });
-    await fs.mkdir(FRAMES_DIR, { recursive: true });
-    await fs.mkdir(CLIPS_DIR, { recursive: true });
-
-    const clipPaths = [];
-    for (let i = 0; i < plan.length; i++) {
-      const imageConfig = plan[i];
-      console.log(`Processing image ${i + 1}/${plan.length}: ${imageConfig.fileName}`);
-      await generateFramesForImage(imageConfig, i);
-      const clipPath = await createClipFromFrames(i, imageConfig.config.duration);
-      clipPaths.push(clipPath);
-    }
-
-    console.log("All clips generated. Combining into final video...");
-    const finalVideoName = await combineClips(clipPaths, plan);
-
-    console.log("Cleaning up temporary files...");
-    await fs.rm(TEMP_DIR, { recursive: true, force: true });
-
-    console.log(`Export complete: ${finalVideoName}`);
-    res.status(200).json({
-      success: true,
-      message: "Export complete!",
-      downloadUrl: `/exports/${finalVideoName}`
-    });
-
-  } catch (error) {
-    console.error("Video export failed:", error);
-    res.status(500).json({ success: false, message: `Export failed: ${error.message}` });
-  }
-});
-
-
-
-
-// POST /api/export-frame - Render a single frame for quick preview
-// Lightweight endpoint that renders a single frame for quick previews.
-app.post("/api/export-frame", async (req, res) => {
-  const plan = req.body.plan;
-  const targetId = req.body.singleFrame;
-
-  if (!plan || !Array.isArray(plan) || plan.length === 0) {
-    return res.status(400).json({ error: "Invalid export plan provided." });
-  }
-  if (!targetId) {
-    return res.status(400).json({ error: "No target image specified for frame export." });
-  }
-
-  const imageIndex = plan.findIndex((item) => item.id === targetId);
-  if (imageIndex === -1) {
-    return res.status(404).json({ error: "Requested image not found in the plan." });
-  }
-
-  const imageConfig = plan[imageIndex];
-  try {
-    const safeId = (imageConfig.id || path.parse(imageConfig.fileName || `image-${imageIndex}`).name)
-      .toString()
-      .replace(/[^a-z0-9_-]/gi, "_")
-      .toLowerCase();
-    const outputName = `frame-${safeId}-${Date.now()}.png`;
-    const outputPath = path.join(EXPORTS_DIR, outputName);
-
-    const motionStyle = imageConfig?.config?.motionStyle || 'ping-pong';
-    let singleProgress = 1;
-    if (motionStyle === 'ping-pong') {
-      singleProgress = 0.5;
-    } else if (motionStyle === 'zoom-out') {
-      singleProgress = 0;
-    }
-
-    await generateFramesForImage(imageConfig, imageIndex, {
-      singleProgress,
-      outputPath,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Frame exported.',
-      downloadUrl: `/exports/${outputName}`,
-    });
-  } catch (error) {
-    console.error('Single frame export failed:', error);
-    res.status(500).json({ success: false, message: `Frame export failed: ${error.message}` });
-  }
-});
-
 // --- Static file serving for images ---
 // Allow direct access to original source images.
 app.use("/images", express.static(IMAGES_DIR));
@@ -727,8 +1259,13 @@ app.get("*", (req, res) => {
 // Ensure directories exist and start listening for requests.
 async function startServer() {
   try {
-    await fs.mkdir(EXPORTS_DIR, { recursive: true });
+    await ensureDirectory(EXPORTS_DIR);
+    await ensureDirectory(OUTPUT_DIR);
+    if (!fileExistsSync(IMAGES_DIR)) {
+      await ensureDirectory(IMAGES_DIR);
+    }
     console.log(`Exports directory ensured at: ${EXPORTS_DIR}`);
+    console.log(`Output directory ensured at: ${OUTPUT_DIR}`);
 
     const server = http.createServer(app);
     server.listen(PORT, HOST, () => {
@@ -741,3 +1278,5 @@ async function startServer() {
 }
 
 startServer();
+
+

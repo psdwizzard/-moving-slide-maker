@@ -26,3 +26,6 @@ images/
 !images/.gitkeep
 
 
+output/**
+!output/.gitkeep
+!output/**/.gitkeep

@@ -49,6 +49,14 @@ function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
+  const [defaultConfig, setDefaultConfig] = useState(DEFAULT_CONFIG);
+  const [projectName, setProjectName] = useState('');
+  const [projectSlug, setProjectSlug] = useState(null);
+  const [projects, setProjects] = useState([]);
+  const [activeProject, setActiveProject] = useState(null);
+  const [showProjectsPanel, setShowProjectsPanel] = useState(false);
+  const [regeneratingImageId, setRegeneratingImageId] = useState(null);
+  const [isSavingDefault, setIsSavingDefault] = useState(false);
 
   // Load the set of available source images when the app boots.
   useEffect(() => {
@@ -70,6 +78,59 @@ function App() {
       });
   }, []);
 
+  useEffect(() => {
+    fetch('/api/settings')
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error('Unable to load settings');
+        }
+        return res.json();
+      })
+      .then((data) => {
+        if (data?.defaultConfig) {
+          setDefaultConfig((prev) => ({
+            ...prev,
+            ...data.defaultConfig
+          }));
+        }
+      })
+      .catch((error) => {
+        console.warn('Failed to load settings', error);
+      });
+  }, []);
+
+  const refreshProjects = useCallback(() => {
+    fetch('/api/projects')
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error('Unable to load projects');
+        }
+        return res.json();
+      })
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setProjects(data);
+        }
+      })
+      .catch((error) => {
+        console.warn('Failed to load projects', error);
+      });
+  }, []);
+
+  useEffect(() => {
+    refreshProjects();
+  }, [refreshProjects]);
+
+  useEffect(() => {
+    if (!images.length) {
+      setSelectedImageId(null);
+      return;
+    }
+    if (!images.some((img) => img.id === selectedImageId)) {
+      setSelectedImageId(images[0].id);
+    }
+  }, [images, selectedImageId]);
+
   // Convenience pointer to whichever image is selected in the gallery.
   const selectedImage = useMemo(() => {
     return images.find((img) => img.id === selectedImageId) || null;
@@ -78,13 +139,13 @@ function App() {
   // Merge stored overrides with defaults to drive the inspector UI.
   const selectedConfig = useMemo(() => {
     if (!selectedImageId) {
-      return DEFAULT_CONFIG;
+      return defaultConfig;
     }
     return {
-      ...DEFAULT_CONFIG,
+      ...defaultConfig,
       ...imageConfigs[selectedImageId]
     };
-  }, [imageConfigs, selectedImageId]);
+  }, [defaultConfig, imageConfigs, selectedImageId]);
 
   // Persist partial updates for the active image and mark preset as custom when needed.
   const updateImageConfig = (imageId, patch) => {
@@ -101,7 +162,7 @@ function App() {
       return {
         ...prev,
         [imageId]: {
-          ...DEFAULT_CONFIG,
+          ...defaultConfig,
           ...current,
           ...normalizedPatch
         }
@@ -116,6 +177,39 @@ function App() {
 
   const isCustomPreset = selectedConfig.preset === 'custom';
 
+  const projectImageMap = useMemo(() => {
+    if (!activeProject || !Array.isArray(activeProject.images)) {
+      return {};
+    }
+    return activeProject.images.reduce((acc, item) => {
+      acc[item.id] = item;
+      return acc;
+    }, {});
+  }, [activeProject]);
+
+  const normalizeManifestImages = useCallback((manifest) => {
+    if (!manifest || !Array.isArray(manifest.images)) {
+      return [];
+    }
+    const slug = manifest.slug || null;
+    return manifest.images.map((item) => {
+      const relativePath = (item.imagePath || `images/${item.fileName || ''}`).replace(/\\/g, '/');
+      let url = item.imageUrl || '';
+      if (!url && slug) {
+        const segments = [slug, ...relativePath.split('/').filter(Boolean)];
+        url = `/projects/${segments.map((segment) => encodeURIComponent(segment)).join('/')}`;
+      }
+      return {
+        id: item.id,
+        fileName: item.fileName,
+        url,
+        thumbnailUrl: url,
+        size: item.size ?? 0,
+        imagePath: relativePath
+      };
+    });
+  }, []);
+
   // Apply the chosen preset values to the current image.
   const handleApplyPreset = (preset) => {
     if (!selectedImageId) {
@@ -129,50 +223,259 @@ function App() {
     });
   };
 
-  // Compose the payload consumed by the export endpoints.
-  const buildPlanPayload = () => ({
-    plan: images.map((image) => ({
-      id: image.id,
-      fileName: image.fileName,
-      config: {
-        ...DEFAULT_CONFIG,
-        ...imageConfigs[image.id]
+  const handleContinue = useCallback(() => {
+    if (!images.length || !selectedImageId) {
+      return;
+    }
+    const currentIndex = images.findIndex((img) => img.id === selectedImageId);
+    if (currentIndex === -1) {
+      return;
+    }
+    const total = images.length;
+    for (let offset = 1; offset <= total; offset++) {
+      const nextIndex = (currentIndex + offset) % total;
+      const candidate = images[nextIndex];
+      const clipInfo = projectImageMap[candidate.id];
+      if (!clipInfo?.clipFile) {
+        setSelectedImageId(candidate.id);
+        return;
       }
-    }))
-  });
+    }
+    const fallbackIndex = (currentIndex + 1) % total;
+    setSelectedImageId(images[fallbackIndex].id);
+  }, [images, selectedImageId, projectImageMap]);
+
+  // Compose the payload consumed by the export endpoints.
+  const buildPlanPayload = useCallback(() => {
+    const trimmedName = projectName.trim();
+    return {
+      ...(trimmedName ? { projectName: trimmedName } : {}),
+      plan: images.map((image) => ({
+        id: image.id,
+        fileName: image.fileName,
+        imagePath: image.imagePath || null,
+        size: image.size,
+        config: {
+          ...defaultConfig,
+          ...imageConfigs[image.id]
+        }
+      }))
+    };
+  }, [defaultConfig, imageConfigs, images, projectName]);
 
   // Trigger the MP4 render flow on the backend.
   const handleExportVideo = async () => {
-    setIsExporting(true);
-    setExportStatus("Exporting video...");
+    const trimmedName = projectName.trim();
+    if (!trimmedName) {
+      setExportStatus('Name your project before exporting.');
+      return;
+    }
 
-    const payload = buildPlanPayload();
+    setIsExporting(true);
+    setExportStatus('Exporting video...');
+
+    const payload = {
+      ...buildPlanPayload(),
+      projectName: trimmedName
+    };
 
     try {
-      const response = await fetch("/api/export-video", {
-        method: "POST",
+      const response = await fetch('/api/export-video', {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
+          'Content-Type': 'application/json'
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(payload)
       });
 
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.message || "Failed to start export");
+        throw new Error(result.message || 'Failed to start export');
+      }
+
+      if (result.manifest) {
+        setActiveProject(result.manifest);
+        setProjectSlug(result.manifest.slug || null);
+        setProjectName(result.manifest.name || trimmedName);
+        setImages(normalizeManifestImages(result.manifest));
+        const nextConfigs = {};
+        (result.manifest.images || []).forEach((item) => {
+          nextConfigs[item.id] = item.config;
+        });
+        setImageConfigs((prev) => ({
+          ...prev,
+          ...nextConfigs
+        }));
+      }
+
+      if (Array.isArray(result.projects)) {
+        setProjects(result.projects);
+      } else {
+        refreshProjects();
       }
 
       if (result.downloadUrl) {
         setExportStatus(`Export complete! Download: ${result.downloadUrl}`);
       } else {
-        setExportStatus(result.message || "Export process initiated.");
+        setExportStatus(result.message || 'Export process initiated.');
       }
     } catch (error) {
       setExportStatus(`Error: ${error.message}`);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleRegenerateClip = async (imageId) => {
+    if (!imageId) {
+      return;
+    }
+    if (!projectSlug) {
+      setExportStatus('Load or export a project before regenerating clips.');
+      return;
     }
 
-    setIsExporting(false);
+    setRegeneratingImageId(imageId);
+    setExportStatus('Regenerating clip...');
+
+    const payload = {
+      imageId,
+      config: {
+        ...defaultConfig,
+        ...imageConfigs[imageId]
+      }
+    };
+
+    try {
+      const response = await fetch(`/api/projects/${projectSlug}/regenerate-clip`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || result.message || 'Clip regeneration failed');
+      }
+
+      if (result.manifest) {
+        setActiveProject(result.manifest);
+        setProjectSlug(result.manifest.slug || projectSlug);
+        if (result.manifest.name) {
+          setProjectName(result.manifest.name);
+        }
+        setImages(normalizeManifestImages(result.manifest));
+        const nextConfigs = {};
+        (result.manifest.images || []).forEach((item) => {
+          nextConfigs[item.id] = item.config;
+        });
+        setImageConfigs((prev) => ({
+          ...prev,
+          ...nextConfigs
+        }));
+      }
+
+      if (Array.isArray(result.projects)) {
+        setProjects(result.projects);
+      } else {
+        refreshProjects();
+      }
+
+      setExportStatus(result.message || 'Clip regenerated.');
+    } catch (error) {
+      setExportStatus(`Clip regeneration failed: ${error.message}`);
+    } finally {
+      setRegeneratingImageId(null);
+    }
+  };
+
+  const handleLoadProject = async (slug) => {
+    if (!slug) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`/api/projects/${slug}`);
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || 'Unable to load project');
+      }
+
+      setActiveProject(result);
+      setProjectSlug(result.slug || slug);
+      if (result.name) {
+        setProjectName(result.name);
+      }
+
+      setImages(normalizeManifestImages(result));
+      const nextConfigs = {};
+      (result.images || []).forEach((item) => {
+        nextConfigs[item.id] = item.config;
+      });
+      setImageConfigs((prev) => ({
+        ...prev,
+        ...nextConfigs
+      }));
+
+      if (result.images && result.images.length) {
+        const availableIds = result.images.map((item) => item.id);
+        if (!availableIds.includes(selectedImageId)) {
+          const fallbackId = availableIds.find((id) => images.some((img) => img.id === id));
+          if (fallbackId) {
+            setSelectedImageId(fallbackId);
+          }
+        }
+      }
+
+      setExportStatus(`Loaded project ${result.name || slug}`);
+      refreshProjects();
+    } catch (error) {
+      setExportStatus(`Failed to load project: ${error.message}`);
+    } finally {
+      setShowProjectsPanel(false);
+    }
+  };
+
+  const handleSaveDefault = async () => {
+    setIsSavingDefault(true);
+    const payload = {
+      defaultConfig: {
+        duration: selectedConfig.duration,
+        zoom: selectedConfig.zoom,
+        fadeDuration: selectedConfig.fadeDuration,
+        motionStyle: selectedConfig.motionStyle,
+        lockZoom: selectedConfig.lockZoom,
+        preset: selectedConfig.preset
+      }
+    };
+
+    try {
+      const response = await fetch('/api/settings/default-config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || result.message || 'Unable to save default');
+      }
+      if (result.defaultConfig) {
+        setDefaultConfig((prev) => ({
+          ...prev,
+          ...result.defaultConfig
+        }));
+      }
+      setExportStatus('Saved default configuration.');
+    } catch (error) {
+      setExportStatus(`Failed to save default: ${error.message}`);
+    } finally {
+      setIsSavingDefault(false);
+    }
   };
 
   // Ask the server for a single rendered frame preview of the focused image.
@@ -219,49 +522,76 @@ function App() {
 
   // Download the current plan as JSON for debugging or hand-off.
   const handleExport = () => {
-    const payload = images.map((image) => ({
-      id: image.id,
-      fileName: image.fileName,
-      config: {
-        ...DEFAULT_CONFIG,
-        ...imageConfigs[image.id]
-      }
-    }));
+    const payload = buildPlanPayload();
+    const safeName = payload.projectName ? payload.projectName.replace(/[^a-z0-9_-]/gi, '_') : 'ken-burns-plan';
 
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: "application/json"
+      type: 'application/json'
     });
     const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
+    const link = document.createElement('a');
     link.href = url;
-    link.download = "ken-burns-plan.json";
+    link.download = `${safeName}.json`;
     link.click();
     URL.revokeObjectURL(url);
-    setExportStatus("Exported configuration JSON");
+    setExportStatus('Exported configuration JSON');
   };
 
   return (
     <div className="App">
       <header className="App__header">
-        <h1>Ken Burns Studio</h1>
-        <div className="App__layoutToggle">
-          <button
-            className={viewMode === "grid" ? "active" : ""}
-            onClick={() => setViewMode("grid")}
-          >
-            Grid
-          </button>
-          <button
-            className={viewMode === "list" ? "active" : ""}
-            onClick={() => setViewMode("list")}
-          >
-            List
-          </button>
+        <div className="App__headerMain">
+          <div className="App__titleGroup">
+            <h1>Moving Slide Maker</h1>
+            <div className="App__projectControls">
+              <label>
+                Project
+                <input
+                  type="text"
+                  value={projectName}
+                  onChange={(event) => setProjectName(event.target.value)}
+                  placeholder="Untitled project"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  refreshProjects();
+                  setShowProjectsPanel(true);
+                }}
+              >
+                Browse Projects
+              </button>
+            </div>
+          </div>
+          <div className="App__layoutToggle">
+            <button
+              className={viewMode === "grid" ? "active" : ""}
+              onClick={() => setViewMode("grid")}
+            >
+              Grid
+            </button>
+            <button
+              className={viewMode === "list" ? "active" : ""}
+              onClick={() => setViewMode("list")}
+            >
+              List
+            </button>
+          </div>
         </div>
         <div className="App__headerActions">
-          <button onClick={handleExport}>Export</button>
+          <button onClick={handleExport}>Export JSON</button>
         </div>
       </header>
+
+      {showProjectsPanel && (
+        <ProjectsPanel
+          projects={projects}
+          activeSlug={projectSlug}
+          onSelect={(slug) => handleLoadProject(slug)}
+          onClose={() => setShowProjectsPanel(false)}
+        />
+      )}
 
       <div className="App__body">
         <aside className={`Gallery Gallery--${viewMode}`}>
@@ -278,7 +608,12 @@ function App() {
               onClick={() => setSelectedImageId(image.id)}
             >
               <img src={image.thumbnailUrl} alt={image.fileName} />
-              <span>{image.fileName}</span>
+              <span className="Gallery__itemLabel">
+                {image.fileName}
+                {projectImageMap[image.id]?.clipFile && (
+                  <span className="Gallery__badge">Saved</span>
+                )}
+              </span>
             </button>
           ))}
         </aside>
@@ -288,7 +623,15 @@ function App() {
             <MainViewer
               image={selectedImage}
               config={selectedConfig}
+              clipInfo={projectImageMap[selectedImage.id]}
+              canRegenerate={Boolean(projectSlug)}
+              isRegenerating={regeneratingImageId === selectedImageId}
+              isExporting={isExporting}
+              isClipDone={Boolean(projectImageMap[selectedImage.id]?.clipFile)}
+              canContinue={images.length > 1}
+              onRegenerateClip={() => handleRegenerateClip(selectedImageId)}
               onUpdateConfig={(patch) => updateImageConfig(selectedImageId, patch)}
+              onContinue={handleContinue}
             />
           ) : (
             <div className="Viewer__empty">Select an image to begin</div>
@@ -397,10 +740,22 @@ function App() {
               />
               <span>Stay zoomed after preview</span>
             </label>
+            <button
+              type="button"
+              className="Toolbar__secondaryButton"
+              onClick={handleSaveDefault}
+              disabled={isSavingDefault}
+            >
+              {isSavingDefault ? 'Saving?' : 'Save as Default'}
+            </button>
           </div>
 
           <div className="Toolbar__group Toolbar__group--actions">
-            <button onClick={handleExportVideo} disabled={isExporting}>
+            <button
+              onClick={handleExportVideo}
+              disabled={isExporting || !projectName.trim()}
+              title={!projectName.trim() ? 'Enter a project name first' : undefined}
+            >
               {isExporting ? "Exporting..." : "Export MP4"}
             </button>
           </div>
@@ -408,6 +763,45 @@ function App() {
         {exportStatus && <div className="App__status">{exportStatus}</div>}
       </footer>
 
+    </div>
+  );
+}
+
+function ProjectsPanel({ projects, activeSlug, onSelect, onClose }) {
+  return (
+    <div className="ProjectsPanel">
+      <div className="ProjectsPanel__inner">
+        <div className="ProjectsPanel__header">
+          <h2>Saved Projects</h2>
+          <button type="button" onClick={onClose}>Close</button>
+        </div>
+        <div className="ProjectsPanel__list">
+          {projects.length === 0 ? (
+            <div className="ProjectsPanel__empty">No exports saved yet.</div>
+          ) : (
+            projects.map((project) => {
+              const updatedAt = project.updatedAt || project.createdAt;
+              const formattedDate = updatedAt ? new Date(updatedAt).toLocaleString() : 'Unknown';
+              const isActive = project.slug === activeSlug;
+              return (
+                <button
+                  key={project.slug}
+                  type="button"
+                  className={
+                    'ProjectsPanel__item' + (isActive ? ' ProjectsPanel__item--active' : '')
+                  }
+                  onClick={() => onSelect(project.slug)}
+                >
+                  <span className="ProjectsPanel__name">{project.name || project.slug}</span>
+                  <span className="ProjectsPanel__meta">
+                    {project.clipCount || 0} clip{project.clipCount === 1 ? '' : 's'} ? {formattedDate}
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -473,7 +867,7 @@ function ActiveAreaOverlay({ metrics, zoom, targetPoint }) {
  * Primary editing surface that wires pointer events, live preview playback,
  * and metric calculations for the selected image.
  */
-function MainViewer({ image, config, onUpdateConfig }) {
+function MainViewer({ image, config, onUpdateConfig, clipInfo, onRegenerateClip, isRegenerating, canRegenerate, isExporting, isClipDone, onContinue, canContinue }) {
   const containerRef = useRef(null);
   const imgRef = useRef(null);
   const [imageMetrics, setImageMetrics] = useState(null);
@@ -676,6 +1070,17 @@ function MainViewer({ image, config, onUpdateConfig }) {
         <div className="Viewer__meta">
           <h2>{image.fileName}</h2>
           <p>{(image.size / 1024 ** 2).toFixed(1)} MB</p>
+          {canRegenerate && (
+            <p className="Viewer__clipMeta">
+              {clipInfo?.clipFile ? `Clip: ${clipInfo.clipFile}` : 'No clip saved yet'}
+            </p>
+          )}
+          {canRegenerate && (
+            <label className="Viewer__doneToggle">
+              <input type="checkbox" checked={Boolean(isClipDone)} readOnly disabled />
+              Clip done
+            </label>
+          )}
         </div>
         <div className="Viewer__buttons">
           <button onClick={handlePreview} disabled={!config.targetPoint || !metricsReady}>
@@ -684,6 +1089,22 @@ function MainViewer({ image, config, onUpdateConfig }) {
           <button onClick={handleClearTarget} disabled={!config.targetPoint}>
             Clear Target
           </button>
+          {onRegenerateClip && (
+            <button
+              onClick={onRegenerateClip}
+              disabled={!canRegenerate || isRegenerating || isExporting}
+            >
+              {isRegenerating ? 'Regenerating?' : 'Regenerate Clip'}
+            </button>
+          )}
+          {onContinue && (
+            <button
+              onClick={onContinue}
+              disabled={!canContinue}
+            >
+              Continue
+            </button>
+          )}
         </div>
       </div>
     </div>

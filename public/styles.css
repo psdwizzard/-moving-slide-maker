@@ -28,11 +28,62 @@ button {
   background: #161b22;
   border-bottom: 1px solid #21262d;
   gap: 1rem;
+  flex-wrap: wrap;
 }
 
 .App__header h1 {
   margin: 0;
   font-size: 1.25rem;
+}
+
+.App__headerMain {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  width: 100%;
+  gap: 1.5rem;
+}
+
+.App__titleGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.App__projectControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.75rem;
+}
+
+.App__projectControls label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
+.App__projectControls input {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #0d1117;
+  color: inherit;
+  min-width: 220px;
+}
+
+.App__projectControls button {
+  padding: 0.4rem 0.85rem;
+  border: 1px solid #30363d;
+  background: #1f6feb33;
+  color: inherit;
+  border-radius: 6px;
+}
+
+.App__projectControls button:hover {
+  background: #1f6feb55;
 }
 
 .App__layoutToggle button,
@@ -97,9 +148,23 @@ button {
   border-radius: 6px;
 }
 
-.Gallery__item span {
+.Gallery__itemLabel {
   font-size: 0.8rem;
-  word-break: break-all;
+  word-break: break-word;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  align-items: center;
+}
+
+.Gallery__badge {
+  font-size: 0.65rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: #238636;
+  color: #ffffff;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
 
 .Gallery__item--active {
@@ -239,6 +304,7 @@ button {
   display: flex;
   align-items: center;
   gap: 0.75rem;
+  flex-wrap: wrap;
 }
 
 .Toolbar__label {
@@ -319,4 +385,131 @@ button {
   margin-top: 0.5rem;
   font-size: 0.8rem;
   color: #58a6ff;
+}
+.Toolbar__secondaryButton {
+  margin-top: 0.5rem;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid #30363d;
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+  align-self: flex-start;
+}
+
+.Toolbar__secondaryButton:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.Viewer__clipMeta {
+  margin: 0;
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
+.Viewer__doneToggle {
+  margin-top: 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  color: #9ca3af;
+}
+
+.Viewer__doneToggle input {
+  width: 1rem;
+  height: 1rem;
+}
+
+.ProjectsPanel {
+  position: fixed;
+  inset: 0;
+  background: rgba(13, 17, 23, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  backdrop-filter: blur(2px);
+}
+
+.ProjectsPanel__inner {
+  width: min(480px, 90vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.25rem;
+  background: #161b22;
+  border-radius: 12px;
+  border: 1px solid #30363d;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+}
+
+.ProjectsPanel__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.ProjectsPanel__header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.ProjectsPanel__header button {
+  padding: 0.35rem 0.75rem;
+  border: 1px solid #30363d;
+  background: transparent;
+  color: inherit;
+  border-radius: 6px;
+}
+
+.ProjectsPanel__header button:hover {
+  background: #1f6feb33;
+}
+
+.ProjectsPanel__list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  max-height: 60vh;
+}
+
+.ProjectsPanel__item {
+  width: 100%;
+  text-align: left;
+  background: #0f141a;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 0.65rem 0.75rem;
+  color: inherit;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.ProjectsPanel__item:hover {
+  border-color: #1f6feb;
+}
+
+.ProjectsPanel__item--active {
+  border-color: #1f6feb;
+  box-shadow: 0 0 0 1px #1f6feb;
+}
+
+.ProjectsPanel__name {
+  font-weight: 600;
+}
+
+.ProjectsPanel__meta {
+  font-size: 0.75rem;
+  color: #8b949e;
+}
+
+.ProjectsPanel__empty {
+  text-align: center;
+  color: #8b949e;
+  padding: 1.5rem 0;
 }
