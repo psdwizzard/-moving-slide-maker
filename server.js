@@ -380,6 +380,103 @@ async function archiveClipsAndFinal(projectDir, clipTempPaths, finalVideoName, m
   };
 }
 
+
+async function refreshProjectManifest(projectDir, slug, existingManifest) {
+  const manifest = existingManifest ? { ...existingManifest } : { slug, name: slug, images: [] };
+  manifest.slug = slug;
+  manifest.name = manifest.name || slug;
+  const imagesDir = path.join(projectDir, 'images');
+  const clipsDir = path.join(projectDir, 'clips');
+
+  const existingImageMap = new Map();
+  if (Array.isArray(manifest.images)) {
+    manifest.images.forEach((image) => {
+      if (image?.id) {
+        existingImageMap.set(image.id, image);
+      }
+    });
+  }
+
+  let imageEntries = [];
+  if (await pathExists(imagesDir)) {
+    const imageFiles = await fsp.readdir(imagesDir, { withFileTypes: true });
+    imageEntries = await Promise.all(
+      imageFiles
+        .filter((entry) => entry.isFile())
+        .map(async (entry) => {
+          const fileName = entry.name;
+          const absolutePath = path.join(imagesDir, fileName);
+          const stats = await fsp.stat(absolutePath);
+          const id = path.parse(fileName).name;
+          const existing = existingImageMap.get(id) || {};
+          return {
+            id,
+            fileName,
+            imagePath: path.posix.join('images', fileName),
+            imageUrl: existing.imageUrl || null,
+            size: stats.size,
+            config: existing.config ? { ...existing.config } : {},
+            clipFile: existing.clipFile || null
+          };
+        })
+    );
+    imageEntries.sort((a, b) => a.fileName.localeCompare(b.fileName, undefined, { numeric: true }));
+  }
+
+  manifest.images = imageEntries.map((entry) => {
+    const existing = existingImageMap.get(entry.id);
+    const config = existing?.config ? { ...existing.config } : entry.config || {};
+    return {
+      ...entry,
+      config: resolveConfigWithDefaults(config, BASE_DEFAULT_CONFIG)
+    };
+  });
+
+  const clipsOnDisk = new Map();
+  if (await pathExists(clipsDir)) {
+    const clipFiles = await fsp.readdir(clipsDir, { withFileTypes: true });
+    clipFiles.forEach((entry) => {
+      if (!entry.isFile()) {
+        return;
+      }
+      const match = entry.name.match(/^clip-(\d+)\.mp4$/i);
+      if (!match) {
+        return;
+      }
+      const index = Number.parseInt(match[1], 10);
+      if (!Number.isInteger(index)) {
+        return;
+      }
+      const relativePath = path.posix.join('clips', entry.name);
+      clipsOnDisk.set(index, relativePath);
+    });
+  }
+
+  manifest.images = await Promise.all(
+    manifest.images.map(async (image, index) => {
+      let clipFile = image.clipFile || null;
+      if (clipFile) {
+        const clipAbsolute = path.join(projectDir, ...toPosixPath(clipFile).split('/'));
+        if (await pathExists(clipAbsolute)) {
+          return { ...image, clipFile: toPosixPath(clipFile) };
+        }
+      }
+      const fallback = clipsOnDisk.get(index) || null;
+      return {
+        ...image,
+        clipFile: fallback ? toPosixPath(fallback) : null
+      };
+    })
+  );
+
+  manifest.updatedAt = new Date().toISOString();
+  manifest.createdAt = manifest.createdAt || manifest.updatedAt;
+  manifest.finalVideo = manifest.finalVideo || null;
+
+  await saveManifest(projectDir, manifest);
+  return hydrateManifest(manifest, slug);
+}
+
 async function resolvePlanWithDefaults(plan, defaultConfig, settings, options = {}) {
   const resolved = [];
   let mutated = false;
@@ -511,6 +608,28 @@ app.post("/api/settings/default-config", async (req, res) => {
   } catch (error) {
     console.error('Failed to update default config:', error);
     res.status(500).json({ error: 'Unable to update default config' });
+  }
+});
+
+app.post("/api/projects/:project/refresh-manifest", async (req, res) => {
+  const slug = sanitizeProjectName(req.params.project);
+  if (!slug) {
+    return res.status(400).json({ error: 'Invalid project name' });
+  }
+
+  const projectDir = path.join(OUTPUT_DIR, slug);
+  if (!(await pathExists(projectDir))) {
+    return res.status(404).json({ error: 'Project not found' });
+  }
+
+  try {
+    const existingManifest = await loadManifest(projectDir);
+    const refreshed = await refreshProjectManifest(projectDir, slug, existingManifest);
+    const projects = await listProjects();
+    res.json({ success: true, manifest: refreshed, projects, message: 'Project manifest refreshed.' });
+  } catch (error) {
+    console.error('Failed to refresh manifest:', error);
+    res.status(500).json({ error: `Refresh failed: ${error.message}` });
   }
 });
 

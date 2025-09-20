@@ -257,9 +257,53 @@ function App() {
     }
   }, []);
 
+  const handleRefreshManifest = useCallback(async () => {
+    if (!projectSlug) {
+      setExportStatus('Load or export a project before refreshing.');
+      return;
+    }
+    setIsProcessing(true);
+    setExportStatus('Refreshing project manifest...');
+    try {
+      const response = await fetch(`/api/projects/${projectSlug}/refresh-manifest`, {
+        method: 'POST'
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error || result.message || 'Refresh failed');
+      }
+      if (result.manifest) {
+        setActiveProject(result.manifest);
+        setProjectSlug(result.manifest.slug || projectSlug);
+        if (result.manifest.name) {
+          setProjectName(result.manifest.name);
+        }
+        setImages(normalizeManifestImages(result.manifest));
+        const nextConfigs = {};
+        (result.manifest.images || []).forEach((item) => {
+          nextConfigs[item.id] = item.config;
+        });
+        setImageConfigs((prev) => ({
+          ...prev,
+          ...nextConfigs
+        }));
+      }
+      if (Array.isArray(result.projects)) {
+        setProjects(result.projects);
+      } else {
+        refreshProjects();
+      }
+      setExportStatus(result.message || 'Project manifest refreshed.');
+    } catch (error) {
+      setExportStatus(`Refresh failed: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [projectSlug, refreshProjects, normalizeManifestImages]);
+
   const isRangeMode = exportScope === 'range';
   const exportButtonDisabled =
-    isExporting || !projectName.trim() || (isRangeMode && !exportRange.trim());
+    isExporting || isProcessing || !projectName.trim() || (isRangeMode && !exportRange.trim());
   const exportButtonTitle = !projectName.trim()
     ? 'Enter a project name first'
     : isRangeMode && !exportRange.trim()
@@ -616,6 +660,12 @@ function App() {
           </div>
         </div>
         <div className="App__headerActions">
+          <button
+            onClick={handleRefreshManifest}
+            disabled={!projectSlug || isProcessing || isExporting}
+          >
+            {isProcessing ? 'Updating...' : 'Update Project'}
+          </button>
           <button onClick={handleExport}>Export JSON</button>
         </div>
       </header>

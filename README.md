@@ -25,6 +25,7 @@ Moving Slide Maker is a Ken Burns style slideshow tool that lets you define per-
 ## Project Workflow
 - **Export MP4** requires a project name; as each clip finishes encoding it is copied into `output/<project>/clips/`, and the combined montage is saved alongside the usual download link under `public/exports/`.
 - Use the export mode dropdown to render every clip, just missing clips, or a specific numbered range (e.g. `1-4,6`).
+- Hit **Update Project** to rescan `output/<project>` and sync the manifest with any clips or images you added by hand.
 - Open **Browse Projects** to load previous runs, review which clips exist, or regenerate just the slide you changed.
 - Use **Save as Default** in the toolbar to persist the current duration/zoom/fade settings for the next session.
 
