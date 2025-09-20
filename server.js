@@ -703,9 +703,18 @@ app.post("/api/export-video", async (req, res) => {
         console.log(`Processing image ${i + 1}/${resolvedPlan.length}: ${preparedImage.fileName}`);
         await generateFramesForImage(preparedImage, i);
         const tempClipPath = await createClipFromFrames(i, preparedImage.config.duration);
-        clipPaths.push(tempClipPath);
-        preparedImage.clipFile = path.posix.join('clips', `clip-${i}.mp4`);
+        const clipName = `clip-${i}.mp4`;
+        const projectClipPath = path.join(projectClipsDir, clipName);
+        await fsp.copyFile(tempClipPath, projectClipPath);
+        clipPaths.push(projectClipPath);
+        preparedImage.clipFile = path.posix.join('clips', clipName);
         await cleanupFramesForIndex(i);
+        await fsp.unlink(tempClipPath).catch((err) => {
+          if (err?.code !== 'ENOENT') {
+            console.warn(`Failed to remove temp clip ${tempClipPath}:`, err.message);
+          }
+        });
+        existingClipAbsolute = projectClipPath;
       } else {
         console.log(`Reusing existing clip for image ${i + 1}`);
         clipPaths.push(existingClipAbsolute);
