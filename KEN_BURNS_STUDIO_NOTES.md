@@ -1,50 +1,70 @@
 # Ken Burns Studio Notes
 
 ## What This Tool Does
-- Interactive UI for picking still images and defining Ken Burns style pans/zooms.
-- Previews the motion locally before exporting clips.
-- Exports either a full MP4 montage or a single representative frame through the backend.
+- Interactive UI for sequencing still images and defining Ken Burns style pans/zooms per slide.
+- Supports named projects that persist manifest data, clip renders, and combined MP4 outputs.
+- Provides multiple export scopes (all clips, missing clips, explicit ranges) plus a manifest refresh button for manual file updates.
+- Mirrors final easing/transform math in the browser so previews match the encoded output.
 
 ## Frontend Overview (`public/app.jsx`)
-- `App` fetches `/api/images`, holds per-image config, and orchestrates exports.
-- Motion presets (`MOTION_PRESETS`) provide quick duration/zoom combos; selecting custom values flips the preset back to `custom`.
-- `MainViewer` measures how the rendered image fits inside the viewport, converts pointer clicks to percentage coordinates, and runs a manual `requestAnimationFrame` loop so the preview easing matches exports.
-- `ActiveAreaOverlay` shows the portion of the source image that will be visible at the chosen zoom level; `TargetMarker` drops a crosshair on the focus point.
-- Footer controls adjust duration, zoom, motion style, fade duration, lock-zoom behavior, and trigger export actions.
-- `handleExportVideo` POSTs the full plan to `/api/export-video`; `handleExportFrame` POSTs the same payload with `singleFrame` so the server renders only the midpoint frame; `handleExport` simply downloads the JSON plan for debugging.
+- `App` bootstraps source imagery (`/api/images`), project metadata (`/api/projects`), defaults (`/api/settings`), and tracks state such as `projectSlug`, `images`, `imageConfigs`, `exportScope`, and `exportRange`.
+- **Project Controls**
+  - Project name is required before exporting; `Browse Projects` opens a panel of saved manifests.
+  - **Update Project** calls `/api/projects/:slug/refresh-manifest`, re-scaning `output/<slug>/images` and `/clips` to synchronise clip presence.
+  - `exportScope` dropdown lets the user choose `all`, `missing`, or `range`; range mode accepts 1-based values like `1-4,6`.
+- Gallery entries display a `clipFile` badge so “Clip done” in the viewer reflects actual manifest data.
+- `MainViewer` measures how an image fits inside the stage, converts pointer clicks to percentage coordinates, and uses a manual `requestAnimationFrame` loop to mirror easing curves. It also exposes **Preview Zoom**, **Clear Target**, **Regenerate Clip**, a read-only clip status checkbox, and a **Continue** button that jumps to the next unfinished slide.
+- Footer controls adjust duration, zoom, motion style, fade, and lock-zoom options. `handleExportVideo` composes the payload with scope metadata; `handleExportFrame` renders a single frame; `handleExport` downloads the JSON plan for debugging.
 
 ## Backend Overview (`server.js`)
-- Express server serves the static SPA, exposes API routes, and launches FFmpeg jobs.
+- Express serves the SPA and exposes JSON APIs.
 - Key routes:
-  - `GET /api/images`: lists files under `images/` so the UI can populate the gallery.
-  - `POST /api/export-video`: regenerates frames into `temp/frames`, encodes per-image clips into `temp/clips`, then stitches them together (applying fades) into `public/exports/ken-burns-effect-<timestamp>.mp4`.
-  - `POST /api/export-frame`: renders a single PNG to `public/exports/frame-<id>-<timestamp>.png` based on the requested progress point.
-- `generateFramesForImage` mirrors the frontend transform logic, oversampling via `RENDER_OVERSAMPLE` (default 2x) before cropping/resizing with `sharp` to reduce ringing during zoom.
-- `createClipFromFrames` feeds each PNG stack to FFmpeg, preferring `h264_nvenc` unless `USE_NVENC=false` or the encoder is missing (it then falls back to `libx264`).
-- `combineClips` builds an `xfade` filter graph to apply per-image fades and concatenates the clips into the final video.
-- Configuration knobs come from environment variables: `PORT`, `HOST`, `RENDER_OVERSAMPLE`, `NVENC_CODEC`, `NVENC_PRESET`, `NVENC_RATE_CONTROL`, `NVENC_CQ`, `X264_PRESET`, and `X264_CRF`. FFmpeg is expected at `C:\ffmpeg\bin\ffmpeg.exe` by default.
+  - `GET /api/images` — returns the gallery manifest, filtering to supported image extensions and exposing `clipFile` when available.
+  - `GET /api/settings` / `POST /api/settings/default-config` — load and persist default slide settings and alternating auto-motion state.
+  - `GET /api/projects` — list saved project manifests with summary metadata.
+  - `GET /api/projects/:slug` — fetch a project's manifest.
+  - `POST /api/projects/:slug/refresh-manifest` — rescan `output/<slug>` to sync images/clips after manual edits.
+  - `POST /api/projects/:slug/regenerate-clip` — re-render a single clip and rebuild the combined montage.
+  - `POST /api/export-video` — render clips according to the requested scope, caching new renders in `output/<slug>/clips/clip-<index>.mp4`, reusing existing clips when possible, then combining them into the final MP4.
+  - `POST /api/export-frame` — render a single PNG snapshot for inspection.
+- `generateFramesForImage` mirrors frontend transform math, oversampling via `RENDER_OVERSAMPLE` (default `2`) to keep zooms crisp.
+- `createClipFromFrames` encodes PNG stacks with FFmpeg, preferring `h264_nvenc` (fallback `libx264` when hardware support is missing).
+- `combineClips` builds an `xfade` filter graph, applying fades and stitching clips into the final video placed under `public/exports/`.
+- `cleanupFramesForIndex` and post-encode logic remove PNG batches and temporary MP4s immediately, preventing disk exhaustion.
+- `refreshProjectManifest` rebuilds manifests by scanning disk, preserving per-slide config when present, ignoring non-image files (e.g. `.gitkeep`), and re-associating `clip-<index>.mp4` files.
 
 ## File & Directory Layout
-- `public/index.html`: loads React/ReactDOM from CDN and bootstraps `app.jsx` with Babel in the browser.
-- `public/styles.css`: layout and overlay styling for the gallery, viewer, and crosshair.
-- `images/`: drop source stills here; they are read directly when generating frames.
-- `public/exports/`: final MP4s and one-off PNG exports land here (directory ensured on startup).
-- `temp/frames` and `temp/clips`: scratch space recreated per export request; deleted automatically afterwards.
-- `start-app.bat`: helper for launching the server locally on Windows.
+- `public/index.html` — bootstraps React/ReactDOM (via CDN) and loads `app.jsx` through Babel.
+- `public/styles.css` — layout, gallery, viewer, overlay, toolbar, and export UI styles.
+- `images/` — ingestion folder; source stills placed here are surfaced in the gallery unless they are `.gitkeep`/unsupported formats.
+- `output/<project>/`
+  - `manifest.json` — saved project state.
+  - `clips/clip-<index>.mp4` — individual clip renders stored during exports/regenerations.
+  - `<project>.mp4` or similar — combined montage, copied alongside the manifest.
+  - `images/` — project-local copies of source stills once a project is created.
+- `public/exports/` — combined MP4s and on-demand PNG frames (directory ensured on startup and exposed over HTTP).
+- `temp/frames` + `temp/clips` — scratch directories recreated per export/regeneration and cleaned automatically.
+- `output/settings.json` — persisted default slide settings and alternating auto-motion pointer.
+- `.gitkeep` placeholders live in ignored directories to keep them present without committing renders.
 
 ## Typical Workflow
-1. Run `npm install` (first time) and `npm start` / `node server.js` to launch the backend.
-2. Browse to `http://127.0.0.1:3000` (server logs also mention the bound host).
-3. Pick an image from the gallery, click on the viewer to set the focus target, and adjust duration/zoom/motion/fade in the footer.
-4. Use **Preview Zoom** to validate the easing path; toggle **Stay zoomed** if you want the preview to remain at the final zoom level.
-5. Export options:
-   - **Export MP4**: kicks off the full render pipeline; watch the status text for progress and a download link.
-   - **Render frame** (via `Export Frame` button): request a single PNG snapshot (currently mid-animation for ping-pong, end frame for zoom-in).
-   - **Export** (JSON): download `ken-burns-plan.json` to archive/share the configuration.
+1. `npm install` (first run) then `npm start` / `node server.js` to boot the backend.
+2. Visit `http://127.0.0.1:3000`, select or create a project name, and queue images from the gallery.
+3. Click the viewer to define focus targets (or leave blank to use the alternating auto-focus fallback), adjust duration/zoom/fade/motion, and optionally **Save as Default** for future slides.
+4. Use **Preview Zoom** to validate motion; **Regenerate Clip** updates an existing slide without re-rendering the entire project.
+5. Choose an export scope:
+   - **All** — render every slide.
+   - **Missing** — render only slides lacking MP4s.
+   - **Range** — render 1-based indices/ranges (e.g. `1-4,6`); missing clips are always included.
+   Hit **Export MP4** to kick off the appropriate workflow; status text reports progress and completion.
+6. If clips or images are added/removed manually in `output/<project>`, press **Update Project** to rescan the directory and refresh the manifest/Gallery UI.
+7. Use **Export JSON** for plan hand-off or debugging, and **Export Frame** for a quick focus preview.
 
 ## Troubleshooting & Notes
-- If FFmpeg reports NVENC errors, the server logs warn and automatically retry with `libx264`.
-- Oversampling increases RAM usage; set `RENDER_OVERSAMPLE=1` if renders are memory constrained.
-- Intermediate `temp/` directories are cleared before and after each export; leftover folders are safe to delete manually.
-- Constants such as `MIN_ARROW_LENGTH` and helpers like `distancePercent` remain for planned interactive tooling enhancements.
-- The `/api/images` route appears twice in `server.js`; both definitions are identical and kept so the route documentation lives alongside each section header.
+- Disk pressure: PNG batches are deleted immediately after each clip render and the temporary MP4 is removed once copied into `output/<project>/clips/`.
+- Export scope logs indicate whether clips are reused or re-rendered (e.g., “Reusing existing clip for image N”).
+- `SUPPORTED_IMAGE_EXTENSIONS` ensures `.gitkeep` and other non-media files are ignored during refresh.
+- If NVENC hardware encoding fails, the server automatically falls back to `libx264` and logs a warning.
+- Set `RENDER_OVERSAMPLE=1` to reduce memory usage during frame generation.
+- Temporary directories are recreated per export; it is safe to delete `temp/` if a run aborts.
+- Constants like `MIN_ARROW_LENGTH` remain for future interactive tooling enhancements.
